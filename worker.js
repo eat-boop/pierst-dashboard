@@ -185,8 +185,8 @@ function deputyHeaders(env) {
    "No. of transactions:" line before the next "Date:" line. */
 function parseDailyInsight(text) {
   const clean = String(text)
-    .replace(/[‎‏‪-‮⁦-⁩﻿]/g, "")
-    .replace(/[  ]/g, " ")
+    .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "")
+    .replace(/[\u00a0\u202f]/g, " ")
     .replace(/\r\n?/g, "\n");
   const DATE_RE = /^\W*date\s*[:\-]\s*(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})\b/i;
   const COUNT_RE = /^\W*(?:no\.?\s*of|number\s+of)?\s*transactions\s*[:\-]\s*([\d,]+)\s*$/i;
@@ -214,6 +214,57 @@ function parseDailyInsight(text) {
     }
   }
   return Object.keys(byDate).sort().map((date) => ({ date, count: byDate[date] }));
+}
+
+/* All uploaded transaction counts live in ONE storage key ({ 'YYYY-MM-DD': count }),
+   so a dashboard load is one read instead of one read per day. The per-day keys
+   the shell writes are kept too; if the summary is missing (data uploaded before
+   this existed), it is rebuilt once from them. */
+const POS_DAYS_KEY = "posdays:v1";
+async function posDays(env) {
+  const raw = await env.TOKENS.get(POS_DAYS_KEY);
+  if (raw) {
+    try { return JSON.parse(raw) || {}; } catch (e) {}
+  }
+  const days = {};
+  let cursor;
+  do {
+    const page = await env.TOKENS.list({ prefix: "data:pos:", cursor });
+    await Promise.all(page.keys.map(async (k) => {
+      const v = await env.TOKENS.get(k.name);
+      try {
+        const row = JSON.parse(v);
+        if (row && typeof row.count === "number") days[k.name.slice(9)] = row.count;
+      } catch (e) {}
+    }));
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor);
+  if (Object.keys(days).length) await env.TOKENS.put(POS_DAYS_KEY, JSON.stringify(days));
+  return days;
+}
+
+/* Coverage rule for the WhatsApp-fed count. Revenue comes from Xero for the WHOLE
+   period, so a count covering only part of it would make Average customer spend
+   wrong. A period gets a count only when the uploaded days span it: it must not
+   start before the first uploaded day, and the data must reach its end (capped
+   at today). Today's message may be missing (it arrives mid-afternoon) as long as
+   yesterday's is in. Otherwise the card shows "—", never a partial figure. */
+function venueToday(tz) {
+  try {
+    return new Intl.DateTimeFormat("en-CA", { timeZone: tz || "Australia/Melbourne", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+  } catch (e) {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+function posCovers(days, from, to, today) {
+  const dates = Object.keys(days).sort();
+  if (!dates.length) return false;
+  const first = dates[0], last = dates[dates.length - 1];
+  const end = to < today ? to : today;
+  if (from > end) return false;
+  if (from < first) return false;
+  if (end <= last) return true;
+  return end === today && last >= addDays(today, -1);
 }
 
 const ADAPTERS = {
@@ -303,22 +354,42 @@ const ADAPTERS = {
     mode: "export",
     oauth: {},
     async status(env, h) {
-      const last = await lastSync(env, "pos");
-      return { connected: !!last, org: "Impos, via WhatsApp Daily Insight", sandbox: false, lastSync: last || null };
+      const days = await posDays(env);
+      const any = Object.keys(days).length > 0;
+      const last = any ? await lastSync(env, "pos") : null;
+      return { connected: any, org: "Impos, via WhatsApp Daily Insight", sandbox: false, lastSync: last || null };
     },
     async parseExport(env, h, raw) {
-      return parseDailyInsight(raw && raw.text || "");
+      const rows = parseDailyInsight(raw && raw.text || "");
+      if (rows.length) {
+        const days = await posDays(env);
+        for (const r of rows) days[r.date] = r.count;
+        await env.TOKENS.put(POS_DAYS_KEY, JSON.stringify(days));
+      }
+      return rows;
     },
     async fetchRange(env, h, q) {
-      const r = await h.readIngested(q.from, q.to);
-      if (!r.daysWithData || typeof r.sums.count !== "number") return null;
-      return { count: r.sums.count };
+      const days = await posDays(env);
+      const today = venueToday(q.tz);
+      if (!posCovers(days, q.from, q.to, today)) return null;
+      let count = 0;
+      for (const [date, n] of Object.entries(days)) {
+        if (date >= q.from && date <= q.to) count += n;
+      }
+      return { count };
     },
     async fetchMonthly(env, h, q) {
-      const m = await h.monthlyIngested(q.fromMonth, q.toMonth);
+      const days = await posDays(env);
+      const today = venueToday(q.tz);
+      const months = monthList(q.fromMonth, q.toMonth);
+      const byMonth = {};
+      for (const [date, n] of Object.entries(days)) {
+        const mo = date.slice(0, 7);
+        byMonth[mo] = (byMonth[mo] || 0) + n;
+      }
       return {
-        months: m.months,
-        count: m.byMonth.map((s) => s && typeof s.count === "number" ? s.count : null)
+        months,
+        count: months.map((mo) => posCovers(days, mo + "-01", lastDayOfMonth(mo), today) ? (byMonth[mo] || 0) : null)
       };
     }
   },
@@ -857,22 +928,24 @@ async function sourceStatus(env, source) {
 
 async function fetchSlot(env, q) {
   /* One period slot: pull each configured source; null where unavailable. */
+  /* Sources are fetched in parallel - one slow tool never holds up the others. */
   const out = {};
-  for (const source of ['accounting', 'pos', 'rostering']) {
+  await Promise.all(['accounting', 'pos', 'rostering'].map(async (source) => {
     const adapter = ADAPTERS[source];
-    if (!adapter || !adapter.configured) { out[source] = null; continue; }
+    if (!adapter || !adapter.configured) { out[source] = null; return; }
     try {
       const h = makeHelpers(env, source);
       out[source] = await adapter.fetchRange(env, h, q);
-      await noteSync(env, source);
+      /* export-fed sources record their sync time when a file arrives, not on every read */
+      if (out[source] && adapter.mode !== 'export') await noteSync(env, source);
     } catch (err) {
       out[source] = null; /* per-source failure never breaks the whole payload */
     }
-  }
+  }));
   return out;
 }
 
-const METRICS_CACHE_TTL = 120; /* seconds: brief cache for live provider data */
+const METRICS_CACHE_TTL = 600; /* seconds: 10-minute cache for provider data; the Refresh button (?refresh=1) always fetches fresh */
 
 async function apiMetrics(env, url) {
   const cur = parseRange(url.searchParams.get('cur'));
@@ -907,24 +980,28 @@ async function apiMetrics(env, url) {
     if (cached) { try { data = JSON.parse(cached); } catch (e) { data = null; } }
   }
   if (!data) {
-    const periods = {};
-    periods.cur = await fetchSlot(env, { ...base, ...cur });
-    periods.prev = prev ? await fetchSlot(env, { ...base, ...prev }) : null;
-    periods.yoy = yoy ? await fetchSlot(env, { ...base, ...yoy }) : null;
-
-    let trendOut = null;
-    if (trend) {
-      trendOut = { months: monthList(trend.fromMonth, trend.toMonth) };
-      for (const source of ['accounting', 'pos']) {
+    /* The three periods and the trend are fetched in parallel. */
+    const trendTask = async () => {
+      if (!trend) return null;
+      const t = { months: monthList(trend.fromMonth, trend.toMonth) };
+      await Promise.all(['accounting', 'pos'].map(async (source) => {
         const adapter = ADAPTERS[source];
-        if (!adapter || !adapter.configured) { trendOut[source] = null; continue; }
+        if (!adapter || !adapter.configured) { t[source] = null; return; }
         try {
           const h = makeHelpers(env, source);
           const series = await adapter.fetchMonthly(env, h, { ...base, ...trend });
-          trendOut[source] = alignSeries(trendOut.months, series);
-        } catch (err) { trendOut[source] = null; }
-      }
-    }
+          t[source] = alignSeries(t.months, series);
+        } catch (err) { t[source] = null; }
+      }));
+      return t;
+    };
+    const [pCur, pPrev, pYoy, trendOut] = await Promise.all([
+      fetchSlot(env, { ...base, ...cur }),
+      prev ? fetchSlot(env, { ...base, ...prev }) : null,
+      yoy ? fetchSlot(env, { ...base, ...yoy }) : null,
+      trendTask()
+    ]);
+    const periods = { cur: pCur, prev: pPrev, yoy: pYoy };
     data = { generatedAt: new Date().toISOString(), periods: periods, trend: trendOut };
     if (env.TOKENS) {
       try { await env.TOKENS.put(cacheKey, JSON.stringify(data), { expirationTtl: METRICS_CACHE_TTL }); } catch (e) {}
