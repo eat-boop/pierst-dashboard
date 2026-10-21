@@ -1,102 +1,211 @@
-/* ============================================================================
-   Venue dashboard - Worker shell (ships in the FC Member Dashboard Kit)
+var __defProp = Object.defineProperty;
+var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
-   You are the AI running this build. This file is YOURS to finish; the owner
-   never sees it. The shell already does the hard plumbing:
+// worker.js
+import dashboardHtml from "./aec0cdce3a6659983a4903b7db99548b87cf1e88-dashboard.html";
 
-     - serves the dashboard page
-     - a metrics API with a fixed contract the page already understands
-     - an OAuth2 begin/callback flow with token storage
-     - automatic access-token refresh, INCLUDING rotating refresh tokens
-       (Xero rotates the refresh token on every refresh - the store persists
-       the new one every time; never cache tokens outside the store)
-     - plain-English connection status for the Connections screen
-     - the no-API rungs built in: POST /api/ingest (file/export data in),
-       an email() handler stub for emailed reports, a scheduled() cron hook,
-       and a KV day-store the export-fed adapters read from
+/* ---------- shared helpers for the adapters ---------- */
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+__name(pad2, "pad2");
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+__name(round2, "round2");
+function num(v) {
+  const n = parseFloat(String(v == null ? "" : v).replace(/,/g, ""));
+  return isFinite(n) ? n : 0;
+}
+__name(num, "num");
+function lastDayOfMonth(mo) {
+  const [y, m] = mo.split("-").map(Number);
+  return mo + "-" + pad2(new Date(Date.UTC(y, m, 0)).getUTCDate());
+}
+__name(lastDayOfMonth, "lastDayOfMonth");
+function shiftMonth(mo, delta) {
+  let [y, m] = mo.split("-").map(Number);
+  m += delta;
+  while (m < 1) { m += 12; y--; }
+  while (m > 12) { m -= 12; y++; }
+  return y + "-" + pad2(m);
+}
+__name(shiftMonth, "shiftMonth");
+function addDays(date, n) {
+  const d = new Date(date + "T12:00:00Z");
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+__name(addDays, "addDays");
 
-   What you fill in: the three ADAPTERS (accounting / pos / rostering), each
-   marked with  >>> ADAPTER ...  blocks. Wire them against the provider's
-   CURRENT documentation, per capability-matrix.md and playbook.md.
+/* ---------- Xero (accounting) ---------- */
+var XERO_API = "https://api.xero.com";
+/* Wage + super accounts are picked out of Operating Expenses by account name. */
+var WAGE_RE = /wage|salar|superann|\bsuper\b|payroll|annual leave|long service|workcover/i;
+async function xeroTenant(env, h) {
+  const tokens = await h.getTokens();
+  if (!tokens || !tokens.access_token) {
+    const e = new Error("no tokens");
+    e.status = 401;
+    throw e;
+  }
+  const raw = await env.TOKENS.get("xero:tenant");
+  if (raw) {
+    try {
+      const c = JSON.parse(raw);
+      if (c.tenantId && c.for === tokens.obtained_at) return c;
+    } catch (e) {
+    }
+  }
+  const conns = await h.fetchJson(XERO_API + "/connections", { headers: { Accept: "application/json" } });
+  const list = (Array.isArray(conns) ? conns : []).filter((c2) => !c2.tenantType || c2.tenantType === "ORGANISATION");
+  if (!list.length) {
+    const e = new Error("no organisation");
+    e.status = 403;
+    throw e;
+  }
+  const c = { tenantId: list[0].tenantId, tenantName: list[0].tenantName || null, for: tokens.obtained_at };
+  await env.TOKENS.put("xero:tenant", JSON.stringify(c));
+  return c;
+}
+__name(xeroTenant, "xeroTenant");
+async function xeroPnl(env, h, params) {
+  const t = await xeroTenant(env, h);
+  const qs = new URLSearchParams(params);
+  const data = await h.fetchJson(XERO_API + "/api.xro/2.0/Reports/ProfitAndLoss?" + qs.toString(), {
+    headers: { Accept: "application/json", "xero-tenant-id": t.tenantId }
+  });
+  const rep = data && data.Reports && data.Reports[0];
+  if (!rep) {
+    const e = new Error("no report");
+    e.status = 500;
+    throw e;
+  }
+  return rep;
+}
+__name(xeroPnl, "xeroPnl");
+/* Splits a Xero P&L into one { revenue, cogs, wagesSuper, overheads } per column.
+   Revenue = income sections except Other Income; COGS = Cost of Sales section;
+   wagesSuper = wage/super accounts in Operating Expenses; overheads = the rest
+   of Operating Expenses. Account rows are summed as Xero reports them (ex GST). */
+function xeroSplit(rep) {
+  const rows = rep.Rows || [];
+  const header = rows.find((r) => r.RowType === "Header");
+  const ncols = header && header.Cells ? Math.max(1, header.Cells.length - 1) : 1;
+  const cols = Array.from({ length: ncols }, () => ({ revenue: 0, cogs: 0, wagesSuper: 0, overheads: 0 }));
+  for (const sec of rows) {
+    if (sec.RowType !== "Section") continue;
+    const title = String(sec.Title || "");
+    let kind = null;
+    if (/other income/i.test(title)) kind = null;
+    else if (/cost of (sales|goods)/i.test(title)) kind = "cogs";
+    else if (/income|revenue|sales/i.test(title)) kind = "revenue";
+    else if (/expense/i.test(title) && !/other/i.test(title)) kind = "opex";
+    if (!kind) continue;
+    for (const r of sec.Rows || []) {
+      if (r.RowType !== "Row" || !r.Cells) continue;
+      const name = String(r.Cells[0] && r.Cells[0].Value || "");
+      for (let i = 0; i < ncols; i++) {
+        const v = num(r.Cells[i + 1] && r.Cells[i + 1].Value);
+        if (kind === "revenue") cols[i].revenue += v;
+        else if (kind === "cogs") cols[i].cogs += v;
+        else if (WAGE_RE.test(name)) cols[i].wagesSuper += v;
+        else cols[i].overheads += v;
+      }
+    }
+  }
+  return cols.map((c) => ({
+    revenue: round2(c.revenue),
+    cogs: round2(c.cogs),
+    wagesSuper: round2(c.wagesSuper),
+    overheads: round2(c.overheads)
+  }));
+}
+__name(xeroSplit, "xeroSplit");
 
-   Rules that bind every adapter (kpi-spec.md is the law):
-     - accounting supplies EVERY money figure, always ex GST/sales tax
-     - pos supplies ONE number: completed transaction count (no voids/refunds)
-     - rostering supplies rostered cost only (projected wage %)
-     - read-only scopes/permissions everywhere
-     - secrets ONLY via Worker secrets (wrangler secret put NAME) - never in
-       this file, never in the repo, never echoed to the owner
+/* ---------- Deputy (rostering) ---------- */
+function deputyBase(env) {
+  let b = String(env.ROSTERING_BASE_URL || "").trim().replace(/\/+$/, "");
+  if (b && !/^https?:\/\//i.test(b)) b = "https://" + b;
+  return b;
+}
+__name(deputyBase, "deputyBase");
+function deputyHeaders(env) {
+  return {
+    Authorization: "Bearer " + String(env.ROSTERING_API_TOKEN || "").trim(),
+    Accept: "application/json",
+    "Content-Type": "application/json"
+  };
+}
+__name(deputyHeaders, "deputyHeaders");
 
-   Bindings expected (wrangler.toml): TOKENS (KV). Secrets: see each adapter.
-============================================================================ */
-
-import dashboardHtml from './dashboard.html';
-
-/* ----------------------------------------------------------------------------
-   Provider adapters - THE PART YOU BUILD.
-   Flip `configured: true` per source as you wire it. Until then the
-   dashboard honestly shows "not configured" (never a fake zero).
----------------------------------------------------------------------------- */
-/* OPTIONAL no-API hooks any adapter may add (the fallback-ladder rungs):
-     mode: 'export'           - source is fed by exports, not a live API
-     parseExport(env, h, raw) - raw = { text, contentType }: parse the tool's
-                                exported CSV/report into day rows:
-                                  pos:        [{ date:'YYYY-MM-DD', count }]
-                                  accounting: [{ date, revenue, cogs, wagesSuper, overheads }]
-                                  rostering:  [{ date, cost }]
-                                Adding parseExport makes the dashboard's
-                                Connections screen offer a file-upload panel
-                                for this source (the guided-upload rung).
-     scheduledPull(env, h)    - cron hook (uncomment [triggers] in
-                                wrangler.toml): fetch the tool's own export
-                                (its report scheduler's output, a saved export
-                                URL) and h.saveIngestedRows(rows).
-   In export mode, implement fetchRange/fetchMonthly via h.readIngested /
-   h.monthlyIngested instead of provider calls. Emailed reports: complete the
-   email() handler at the bottom (needs the owner's domain on their Cloudflare
-   with Email Routing pointed at this Worker). Ingest auth: the INGEST_TOKEN
-   secret; if the owner uploads by hand, that same value is their upload code. */
-const ADAPTERS = {
-
-  /* >>> ADAPTER 1: ACCOUNTING (connect this FIRST - it feeds most of the board)
+var ADAPTERS = {
+  /* >>> ADAPTER 1: ACCOUNTING - Xero
+     OAuth (browser login). Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
+     Redirect URI registered in the Xero app: <origin>/auth/accounting/callback
      Contract:
-       auth: 'oauth' with the oauth{} block filled, or 'token' for a pasted key
        status(env, h)        -> { connected, org, sandbox, lastSync }
        fetchRange(env, h, q) -> { revenue, cogs, wagesSuper, overheads }
-                                 (numbers, ex GST/sales tax, for q.from..q.to
-                                  inclusive, dates in the venue's books)
        fetchMonthly(env, h, q)-> { months:['YYYY-MM',...], revenue:[...],
                                    cogs:[...], wagesSuper:[...], overheads:[...] }
-                                 (align arrays to months; null where no data)
      Map the owner's P&L faithfully: Revenue/Income section (trading income
      only - Other Income excluded), Cost of Sales section, wage + super
      accounts, Operating Expenses less wages/super. Do not re-categorise
      their books. See kpi-spec.md.
-     Example (Xero): oauth with tokenAuth:'basic' (the token endpoint wants
-     HTTP Basic client auth), scopes 'offline_access
-     accounting.reports.profitandloss.read', P&L report endpoint, org name
-     from the connections endpoint, sandbox = tenant name contains
-     'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
   */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
+    configured: true,
+    auth: "oauth",
     oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+      authorizeUrl: "https://login.xero.com/identity/connect/authorize",
+      tokenUrl: "https://identity.xero.com/connect/token",
+      scopes: "offline_access accounting.reports.profitandloss.read",
+      clientIdSecret: "ACCOUNTING_CLIENT_ID",
+      clientSecretSecret: "ACCOUNTING_CLIENT_SECRET",
+      tokenAuth: "basic"
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+    async status(env, h) {
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.access_token) return { connected: false };
+      await h.getValidAccessToken();
+      const t = await xeroTenant(env, h);
+      return {
+        connected: true,
+        org: t.tenantName,
+        sandbox: /demo company/i.test(t.tenantName || "")
+      };
+    },
+    async fetchRange(env, h, q) {
+      const rep = await xeroPnl(env, h, { fromDate: q.from, toDate: q.to });
+      return xeroSplit(rep)[0];
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const byMonth = {};
+      let end = months.length - 1;
+      while (end >= 0) {
+        const n = Math.min(12, end + 1);
+        const endMo = months[end];
+        const params = { fromDate: endMo + "-01", toDate: lastDayOfMonth(endMo), timeframe: "MONTH" };
+        if (n > 1) params.periods = String(n - 1);
+        const cols = xeroSplit(await xeroPnl(env, h, params));
+        /* Xero lists the requested month first, then each earlier month */
+        for (let i = 0; i < n; i++) {
+          if (cols[i]) byMonth[shiftMonth(endMo, -i)] = cols[i];
+        }
+        end -= n;
+      }
+      const out = { months, revenue: [], cogs: [], wagesSuper: [], overheads: [] };
+      for (const mo of months) {
+        const c = byMonth[mo];
+        out.revenue.push(c ? c.revenue : null);
+        out.cogs.push(c ? c.cogs : null);
+        out.wagesSuper.push(c ? c.wagesSuper : null);
+        out.overheads.push(c ? c.overheads : null);
+      }
+      return out;
+    }
   },
-
   /* >>> ADAPTER 2: POS
      Contract:
        status(env, h)        -> { connected, org, sandbox, lastSync }
@@ -114,104 +223,147 @@ const ADAPTERS = {
     configured: false,
     auth: null,
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    async status(env, h) {
+      return { connected: false };
+    },
+    async fetchRange(env, h, q) {
+      throw new NotConfigured("pos");
+    },
+    async fetchMonthly(env, h, q) {
+      throw new NotConfigured("pos");
+    }
   },
-
-  /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
+  /* >>> ADAPTER 3: ROSTERING - Deputy
+     Pasted permanent token. Secrets: ROSTERING_API_TOKEN, plus
+     ROSTERING_BASE_URL = your Deputy address, e.g. https://xxxx.au.deputy.com
      Contract:
        status(env, h)        -> { connected, org, sandbox, lastSync }
        fetchRange(env, h, q) -> { cost }    (rostered labour cost for the
                                   period; powers the PROJECTED wage % only)
-     If this source is gated or absent, leave configured:false - the actual
-     Wage % from accounting already covers the board (fallback ladder).
-     Example (Deputy): pasted permanent token (secret ROSTERING_API_TOKEN).
   */
   rostering: {
-    configured: false,
-    auth: null,
+    configured: true,
+    auth: "token",
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('rostering'); },
-    async fetchMonthly(env, h, q) { return { months: [], cost: [] }; }
+    async status(env, h) {
+      const base = deputyBase(env);
+      if (!env.ROSTERING_API_TOKEN || !base) return { connected: false };
+      await h.fetchJson(base + "/api/v1/me", { headers: deputyHeaders(env) });
+      let org = base;
+      try {
+        org = new URL(base).hostname.split(".")[0];
+      } catch (e) {
+      }
+      return { connected: true, org: "Deputy (" + org + ")", sandbox: false };
+    },
+    async fetchRange(env, h, q) {
+      const base = deputyBase(env);
+      if (!env.ROSTERING_API_TOKEN || !base) throw new NotConfigured("rostering");
+      let start = 0, cost = 0;
+      for (let page = 0; page < 50; page++) {
+        const body = {
+          search: {
+            s1: { field: "Date", type: "ge", data: q.from },
+            s2: { field: "Date", type: "lt", data: addDays(q.to, 1) }
+          },
+          start,
+          max: 500
+        };
+        const rows = await h.fetchJson(base + "/api/v1/resource/Roster/QUERY", {
+          method: "POST",
+          headers: deputyHeaders(env),
+          body: JSON.stringify(body)
+        });
+        if (!Array.isArray(rows) || !rows.length) break;
+        for (const r of rows) cost += num(r.Cost);
+        if (rows.length < 500) break;
+        start += 500;
+      }
+      return { cost: round2(cost) };
+    },
+    async fetchMonthly(env, h, q) {
+      return { months: [], cost: [] };
+    }
   }
 };
-
-/* ============================================================================
-   Everything below is the shell. You should rarely need to edit it.
-============================================================================ */
-
-class NotConfigured extends Error {
-  constructor(source) { super('not configured: ' + source); this.source = source; }
-}
-
-const PLAIN_ERRORS = {
-  401: 'This connection needs reconnecting. Click Reconnect and log in again.',
-  403: 'This connection is missing a permission it needs. Your AI will sort out the access.',
-  429: 'The tool is asking us to slow down. Wait a few minutes, then refresh.',
-  500: 'The tool had a problem at its end. Try refresh in a little while.'
+var NotConfigured = class extends Error {
+  static {
+    __name(this, "NotConfigured");
+  }
+  constructor(source) {
+    super("not configured: " + source);
+    this.source = source;
+  }
+};
+var PLAIN_ERRORS = {
+  401: "This connection needs reconnecting. Click Reconnect and log in again.",
+  403: "This connection is missing a permission it needs. Your AI will sort out the access.",
+  429: "The tool is asking us to slow down. Wait a few minutes, then refresh.",
+  500: "The tool had a problem at its end. Try refresh in a little while."
 };
 function plainError(status) {
-  return PLAIN_ERRORS[status] || ('Something went wrong talking to this tool (code ' + status + '). Try refresh; if it persists, tell your AI.');
+  return PLAIN_ERRORS[status] || "Something went wrong talking to this tool (code " + status + "). Try refresh; if it persists, tell your AI.";
 }
-
-/* ---------------- Token store (KV) with refresh built in ---------------- */
-
+__name(plainError, "plainError");
 async function getTokens(env, source) {
-  const raw = await env.TOKENS.get('tokens:' + source);
+  const raw = await env.TOKENS.get("tokens:" + source);
   return raw ? JSON.parse(raw) : null;
 }
+__name(getTokens, "getTokens");
 async function saveTokens(env, source, tokens) {
-  await env.TOKENS.put('tokens:' + source, JSON.stringify(tokens));
+  await env.TOKENS.put("tokens:" + source, JSON.stringify(tokens));
 }
+__name(saveTokens, "saveTokens");
 async function clearTokens(env, source) {
-  await env.TOKENS.delete('tokens:' + source);
+  await env.TOKENS.delete("tokens:" + source);
 }
+__name(clearTokens, "clearTokens");
 async function noteSync(env, source) {
-  await env.TOKENS.put('lastSync:' + source, new Date().toISOString());
+  await env.TOKENS.put("lastSync:" + source, (/* @__PURE__ */ new Date()).toISOString());
 }
+__name(noteSync, "noteSync");
 async function lastSync(env, source) {
-  return await env.TOKENS.get('lastSync:' + source);
+  return await env.TOKENS.get("lastSync:" + source);
 }
-
-/* Build the POST to an OAuth token endpoint, honouring the adapter's client-auth
-   method. tokenAuth:'basic' -> client id+secret in an HTTP Basic Authorization
-   header, NOT in the body (Xero and most OpenID providers expect this); 'post'
-   (or unset, for back-compat) -> client_id/client_secret in the form body. */
+__name(lastSync, "lastSync");
 function tokenRequestInit(cfg, params, env) {
-  const id = env[cfg.clientIdSecret] || '';
-  const secret = env[cfg.clientSecretSecret] || '';
-  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+  const id = env[cfg.clientIdSecret] || "";
+  const secret = env[cfg.clientSecretSecret] || "";
+  const headers = { "Content-Type": "application/x-www-form-urlencoded" };
   const body = new URLSearchParams(params);
-  if ((cfg.tokenAuth || 'post') === 'basic') {
-    headers['Authorization'] = 'Basic ' + btoa(id + ':' + secret);
+  if ((cfg.tokenAuth || "post") === "basic") {
+    headers["Authorization"] = "Basic " + btoa(id + ":" + secret);
   } else {
-    body.set('client_id', id);
-    body.set('client_secret', secret);
+    body.set("client_id", id);
+    body.set("client_secret", secret);
   }
-  return { method: 'POST', headers: headers, body: body.toString() };
+  return { method: "POST", headers, body: body.toString() };
 }
-
-/* Returns a valid access token for an OAuth source, refreshing (and
-   persisting the ROTATED refresh token) when needed. */
+__name(tokenRequestInit, "tokenRequestInit");
 async function getValidAccessToken(env, source) {
   const adapter = ADAPTERS[source];
   const tokens = await getTokens(env, source);
-  if (!tokens || !tokens.access_token) { const e = new Error('no tokens'); e.status = 401; throw e; }
-  const skewMs = 60 * 1000;
+  if (!tokens || !tokens.access_token) {
+    const e = new Error("no tokens");
+    e.status = 401;
+    throw e;
+  }
+  const skewMs = 60 * 1e3;
   if (!tokens.expires_at || Date.now() < tokens.expires_at - skewMs) return tokens.access_token;
-
-  /* refresh */
   const cfg = adapter.oauth || {};
-  if (!tokens.refresh_token || !cfg.tokenUrl) { const e = new Error('cannot refresh'); e.status = 401; throw e; }
+  if (!tokens.refresh_token || !cfg.tokenUrl) {
+    const e = new Error("cannot refresh");
+    e.status = 401;
+    throw e;
+  }
   const res = await fetch(cfg.tokenUrl, tokenRequestInit(cfg, {
-    grant_type: 'refresh_token',
+    grant_type: "refresh_token",
     refresh_token: tokens.refresh_token
   }, env));
   if (!res.ok) {
-    /* refresh failed: force a reconnect rather than silently serving stale data */
-    const e = new Error('refresh failed'); e.status = 401; throw e;
+    const e = new Error("refresh failed");
+    e.status = 401;
+    throw e;
   }
   const fresh = await res.json();
   const updated = {
@@ -219,376 +371,337 @@ async function getValidAccessToken(env, source) {
     access_token: fresh.access_token,
     /* CRITICAL: many providers (Xero!) rotate the refresh token - always keep the new one */
     refresh_token: fresh.refresh_token || tokens.refresh_token,
-    expires_at: Date.now() + ((fresh.expires_in || 1800) * 1000)
+    expires_at: Date.now() + (fresh.expires_in || 1800) * 1e3
   };
   await saveTokens(env, source, updated);
   return updated.access_token;
 }
-
-/* Helpers handed to every adapter call */
+__name(getValidAccessToken, "getValidAccessToken");
 function makeHelpers(env, source) {
   return {
-    getValidAccessToken: () => getValidAccessToken(env, source),
-    getTokens: () => getTokens(env, source),
-    saveTokens: (t) => saveTokens(env, source, t),
-    noteSync: () => noteSync(env, source),
-    saveIngestedRows: (rows) => saveIngestedRows(env, source, rows),
-    readIngested: (from, to) => readIngested(env, source, from, to),
-    monthlyIngested: (fromMonth, toMonth) => monthlyIngested(env, source, fromMonth, toMonth),
+    getValidAccessToken: /* @__PURE__ */ __name(() => getValidAccessToken(env, source), "getValidAccessToken"),
+    getTokens: /* @__PURE__ */ __name(() => getTokens(env, source), "getTokens"),
+    saveTokens: /* @__PURE__ */ __name((t) => saveTokens(env, source, t), "saveTokens"),
+    noteSync: /* @__PURE__ */ __name(() => noteSync(env, source), "noteSync"),
+    saveIngestedRows: /* @__PURE__ */ __name((rows) => saveIngestedRows(env, source, rows), "saveIngestedRows"),
+    readIngested: /* @__PURE__ */ __name((from, to) => readIngested(env, source, from, to), "readIngested"),
+    monthlyIngested: /* @__PURE__ */ __name((fromMonth, toMonth) => monthlyIngested(env, source, fromMonth, toMonth), "monthlyIngested"),
     /* fetch JSON with one automatic refresh-and-retry on 401 (OAuth sources) */
-    fetchJson: async (url, init, opts) => {
+    fetchJson: /* @__PURE__ */ __name(async (url, init, opts) => {
       const useAuth = !opts || opts.auth !== false;
-      const doFetch = async () => {
-        const headers = new Headers((init && init.headers) || {});
-        if (useAuth && ADAPTERS[source].auth === 'oauth') {
-          headers.set('Authorization', 'Bearer ' + await getValidAccessToken(env, source));
+      const doFetch = /* @__PURE__ */ __name(async () => {
+        const headers = new Headers(init && init.headers || {});
+        if (useAuth && ADAPTERS[source].auth === "oauth") {
+          headers.set("Authorization", "Bearer " + await getValidAccessToken(env, source));
         }
-        return fetch(url, { ...(init || {}), headers });
-      };
+        return fetch(url, { ...init || {}, headers });
+      }, "doFetch");
       let res = await doFetch();
-      if (res.status === 401 && useAuth && ADAPTERS[source].auth === 'oauth') {
+      if (res.status === 401 && useAuth && ADAPTERS[source].auth === "oauth") {
         const t = await getTokens(env, source);
-        if (t) { t.expires_at = 0; await saveTokens(env, source, t); } /* force refresh */
+        if (t) {
+          t.expires_at = 0;
+          await saveTokens(env, source, t);
+        }
         res = await doFetch();
       }
-      if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+      if (!res.ok) {
+        const e = new Error("HTTP " + res.status);
+        e.status = res.status;
+        throw e;
+      }
       return res.json();
-    }
+    }, "fetchJson")
   };
 }
-
-/* ---------------- OAuth begin + callback (generic, per-source) ---------- */
-
+__name(makeHelpers, "makeHelpers");
 function randomState() {
   const a = new Uint8Array(16);
   crypto.getRandomValues(a);
-  return Array.from(a).map((b) => b.toString(16).padStart(2, '0')).join('');
+  return Array.from(a).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
-
-/* ---------------- Owner login: one passcode + a signed session cookie ----
-   The owner sets the dashboard password on the dashboard's own FIRST-RUN screen;
-   it is stored PBKDF2-hashed in KV (sys:passcode_hash) - no Cloudflare Variables
-   step. (env.DASHBOARD_PASSCODE still works as an override, e.g. when the
-   one-click button collected it in its wizard.) The session-signing key is
-   generated and stored in KV on first run (env.SESSION_SECRET overrides if set).
-   Until a password exists the dashboard shows the SET-PASSWORD screen, never an
-   open page; once set, the page and every data route require a valid session. */
-const SESSION_TTL = 60 * 60 * 24 * 30;
-/* A password exists if the owner set one (first-run -> KV) or the deploy provided
-   one as an env override (the one-click button's wizard). */
+__name(randomState, "randomState");
+var SESSION_TTL = 60 * 60 * 24 * 30;
 async function passcodeSet(env) {
   if (env.DASHBOARD_PASSCODE) return true;
-  if (env.TOKENS) return !!(await env.TOKENS.get('sys:passcode_hash'));
+  if (env.TOKENS) return !!await env.TOKENS.get("sys:passcode_hash");
   return false;
 }
-/* PBKDF2-SHA256 of a passcode with a hex salt -> base64url (at-rest hashing). */
+__name(passcodeSet, "passcodeSet");
 async function pbkdf2B64(passcode, saltHex) {
   const salt = Uint8Array.from((saltHex.match(/.{2}/g) || []).map((h) => parseInt(h, 16)));
-  const km = await crypto.subtle.importKey('raw', new TextEncoder().encode(passcode), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: salt, iterations: 100000, hash: 'SHA-256' }, km, 256);
+  const km = await crypto.subtle.importKey("raw", new TextEncoder().encode(passcode), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: 1e5, hash: "SHA-256" }, km, 256);
   return b64url(bits);
 }
-let _sessionKeyCache = null;
+__name(pbkdf2B64, "pbkdf2B64");
+var _sessionKeyCache = null;
 async function getSessionKey(env) {
   if (env.SESSION_SECRET) return env.SESSION_SECRET;
   if (_sessionKeyCache) return _sessionKeyCache;
   if (env.TOKENS) {
-    let k = await env.TOKENS.get('sys:session_secret');
+    let k = await env.TOKENS.get("sys:session_secret");
     if (!k) {
       const b = new Uint8Array(32);
       crypto.getRandomValues(b);
-      k = Array.from(b).map((x) => x.toString(16).padStart(2, '0')).join('');
-      await env.TOKENS.put('sys:session_secret', k);
+      k = Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
+      await env.TOKENS.put("sys:session_secret", k);
     }
     _sessionKeyCache = k;
     return k;
   }
-  return env.DASHBOARD_PASSCODE || 'unset';
+  return env.DASHBOARD_PASSCODE || "unset";
 }
+__name(getSessionKey, "getSessionKey");
 function b64url(buf) {
-  return btoa(String.fromCharCode.apply(null, new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return btoa(String.fromCharCode.apply(null, new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
+__name(b64url, "b64url");
 async function hmacB64(secret, msg) {
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  return b64url(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg)));
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return b64url(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(msg)));
 }
+__name(hmacB64, "hmacB64");
 async function shaB64(s) {
-  return b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)));
+  return b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)));
 }
+__name(shaB64, "shaB64");
 function timingSafeEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
   let r = 0;
   for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return r === 0;
 }
+__name(timingSafeEqual, "timingSafeEqual");
 async function makeSession(env) {
-  const payload = 'v1.' + Math.floor(Date.now() / 1000);
-  return payload + '.' + await hmacB64(await getSessionKey(env), payload);
+  const payload = "v1." + Math.floor(Date.now() / 1e3);
+  return payload + "." + await hmacB64(await getSessionKey(env), payload);
 }
+__name(makeSession, "makeSession");
 async function validSession(env, token) {
   if (!token) return false;
-  const i = token.lastIndexOf('.');
+  const i = token.lastIndexOf(".");
   if (i < 0) return false;
   const payload = token.slice(0, i);
   if (!timingSafeEqual(token.slice(i + 1), await hmacB64(await getSessionKey(env), payload))) return false;
-  const issued = parseInt(payload.split('.')[1], 10);
-  return !!issued && (Date.now() / 1000 - issued) <= SESSION_TTL;
+  const issued = parseInt(payload.split(".")[1], 10);
+  return !!issued && Date.now() / 1e3 - issued <= SESSION_TTL;
 }
+__name(validSession, "validSession");
 function getCookie(request, name) {
-  const m = (request.headers.get('Cookie') || '').match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+  const m = (request.headers.get("Cookie") || "").match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
   return m ? decodeURIComponent(m[1]) : null;
 }
+__name(getCookie, "getCookie");
 async function isLoggedIn(request, env) {
-  return await validSession(env, getCookie(request, 'vd_session'));
+  return await validSession(env, getCookie(request, "vd_session"));
 }
+__name(isLoggedIn, "isLoggedIn");
 function htmlResponse(html) {
-  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer' } });
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer" } });
 }
+__name(htmlResponse, "htmlResponse");
 async function apiLogin(env, request) {
-  if (!(await passcodeSet(env))) return json({ ok: false, error: 'no_passcode' }, 400);
-  let body; try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
-  const passcode = String((body && body.passcode) || '');
+  if (!await passcodeSet(env)) return json({ ok: false, error: "no_passcode" }, 400);
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ ok: false }, 400);
+  }
+  const passcode = String(body && body.passcode || "");
   let okPass = false;
   if (env.DASHBOARD_PASSCODE) {
     okPass = timingSafeEqual(await shaB64(passcode), await shaB64(env.DASHBOARD_PASSCODE));
   } else if (env.TOKENS) {
-    const stored = await env.TOKENS.get('sys:passcode_hash');
+    const stored = await env.TOKENS.get("sys:passcode_hash");
     if (stored) {
-      const dot = stored.indexOf('.');
+      const dot = stored.indexOf(".");
       okPass = timingSafeEqual(await pbkdf2B64(passcode, stored.slice(0, dot)), stored.slice(dot + 1));
     }
   }
   if (!okPass) return json({ ok: false }, 401);
   const token = await makeSession(env);
-  return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Set-Cookie': 'vd_session=' + encodeURIComponent(token) + '; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=' + SESSION_TTL } });
+  return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json", "Cache-Control": "no-store", "Set-Cookie": "vd_session=" + encodeURIComponent(token) + "; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=" + SESSION_TTL } });
 }
-
-/* First-run (or authenticated change): set the dashboard password. Allowed only
-   when none is set yet, OR when the caller already holds a valid session - so a
-   stranger can never overwrite an existing password. Stored PBKDF2-hashed in KV. */
+__name(apiLogin, "apiLogin");
 async function apiSetup(env, request) {
-  if (!env.TOKENS) return json({ ok: false, error: 'no_store' }, 400);
-  if ((await passcodeSet(env)) && !(await isLoggedIn(request, env))) return json({ ok: false, error: 'exists' }, 403);
-  let body; try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
-  const passcode = String((body && body.passcode) || '');
-  if (passcode.length < 6) return json({ ok: false, error: 'too_short' }, 400);
-  const saltB = new Uint8Array(16); crypto.getRandomValues(saltB);
-  const saltHex = Array.from(saltB).map((x) => x.toString(16).padStart(2, '0')).join('');
-  await env.TOKENS.put('sys:passcode_hash', saltHex + '.' + (await pbkdf2B64(passcode, saltHex)));
+  if (!env.TOKENS) return json({ ok: false, error: "no_store" }, 400);
+  if (await passcodeSet(env) && !await isLoggedIn(request, env)) return json({ ok: false, error: "exists" }, 403);
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ ok: false }, 400);
+  }
+  const passcode = String(body && body.passcode || "");
+  if (passcode.length < 6) return json({ ok: false, error: "too_short" }, 400);
+  const saltB = new Uint8Array(16);
+  crypto.getRandomValues(saltB);
+  const saltHex = Array.from(saltB).map((x) => x.toString(16).padStart(2, "0")).join("");
+  await env.TOKENS.put("sys:passcode_hash", saltHex + "." + await pbkdf2B64(passcode, saltHex));
   const token = await makeSession(env);
-  return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Set-Cookie': 'vd_session=' + encodeURIComponent(token) + '; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=' + SESSION_TTL } });
+  return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json", "Cache-Control": "no-store", "Set-Cookie": "vd_session=" + encodeURIComponent(token) + "; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=" + SESSION_TTL } });
 }
+__name(apiSetup, "apiSetup");
 function apiLogout() {
-  return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Set-Cookie': 'vd_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0' } });
+  return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json", "Cache-Control": "no-store", "Set-Cookie": "vd_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0" } });
 }
+__name(apiLogout, "apiLogout");
 function loginPage() {
-  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign in</title>'
-    + '<link href="https://fonts.googleapis.com/css2?family=Khand:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">'
-    + '<style>'
-    + 'body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#FAF7F2;font-family:"DM Sans",sans-serif;color:#2A2420}'
-    + '.box{width:90%;max-width:360px;background:#fffdf9;border:1px solid rgba(13,13,13,0.08);border-radius:16px;padding:2rem 1.75rem}'
-    + 'h1{font-family:"Khand",sans-serif;font-size:30px;font-weight:700;color:#0D0D0D;margin:0 0 0.4rem}'
-    + 'p{font-size:14px;color:#8C8075;margin:0 0 1.25rem;line-height:1.6}'
-    + 'input{width:100%;font-family:"DM Sans",sans-serif;font-size:15px;padding:12px 14px;border:1px solid rgba(13,13,13,0.14);border-radius:10px;background:#fff;color:#2A2420;box-sizing:border-box}'
-    + 'input:focus{outline:none;border-color:#F2A900}'
-    + 'button{width:100%;margin-top:12px;padding:13px;font-size:15px;font-weight:500;font-family:"DM Sans",sans-serif;color:#0D0D0D;background:#F2A900;border:none;border-radius:10px;cursor:pointer}'
-    + '.err{color:#C04B28;font-size:13px;margin-top:10px;min-height:16px}'
-    + '</style></head><body>'
-    + '<div class="box"><h1>Your dashboard</h1><p>Enter the password for this dashboard.</p>'
-    + '<form id="f"><input id="p" type="password" autocomplete="current-password" placeholder="Password" autofocus>'
-    + '<button type="submit">Sign in</button><div class="err" id="e"></div></form></div>'
-    + '<script>'
-    + 'var f=document.getElementById("f");'
-    + 'f.onsubmit=function(ev){ev.preventDefault();var e=document.getElementById("e");e.textContent="";'
-    + 'fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({passcode:document.getElementById("p").value})})'
-    + '.then(function(r){if(r.ok){location.reload();}else{e.textContent="That password did not match. Try again.";}})'
-    + '.catch(function(){e.textContent="Something went wrong. Try again.";});};'
-    + '</script></body></html>';
+  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign in</title><link href="https://fonts.googleapis.com/css2?family=Khand:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"><style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#FAF7F2;font-family:"DM Sans",sans-serif;color:#2A2420}.box{width:90%;max-width:360px;background:#fffdf9;border:1px solid rgba(13,13,13,0.08);border-radius:16px;padding:2rem 1.75rem}h1{font-family:"Khand",sans-serif;font-size:30px;font-weight:700;color:#0D0D0D;margin:0 0 0.4rem}p{font-size:14px;color:#8C8075;margin:0 0 1.25rem;line-height:1.6}input{width:100%;font-family:"DM Sans",sans-serif;font-size:15px;padding:12px 14px;border:1px solid rgba(13,13,13,0.14);border-radius:10px;background:#fff;color:#2A2420;box-sizing:border-box}input:focus{outline:none;border-color:#F2A900}button{width:100%;margin-top:12px;padding:13px;font-size:15px;font-weight:500;font-family:"DM Sans",sans-serif;color:#0D0D0D;background:#F2A900;border:none;border-radius:10px;cursor:pointer}.err{color:#C04B28;font-size:13px;margin-top:10px;min-height:16px}</style></head><body><div class="box"><h1>Your dashboard</h1><p>Enter the password for this dashboard.</p><form id="f"><input id="p" type="password" autocomplete="current-password" placeholder="Password" autofocus><button type="submit">Sign in</button><div class="err" id="e"></div></form></div><script>var f=document.getElementById("f");f.onsubmit=function(ev){ev.preventDefault();var e=document.getElementById("e");e.textContent="";fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({passcode:document.getElementById("p").value})}).then(function(r){if(r.ok){location.reload();}else{e.textContent="That password did not match. Try again.";}}).catch(function(){e.textContent="Something went wrong. Try again.";});};<\/script></body></html>';
 }
-
+__name(loginPage, "loginPage");
 function setupPage() {
-  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Set your password</title>'
-    + '<link href="https://fonts.googleapis.com/css2?family=Khand:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">'
-    + '<style>'
-    + 'body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#FAF7F2;font-family:"DM Sans",sans-serif;color:#2A2420}'
-    + '.box{width:90%;max-width:360px;background:#fffdf9;border:1px solid rgba(13,13,13,0.08);border-radius:16px;padding:2rem 1.75rem}'
-    + 'h1{font-family:"Khand",sans-serif;font-size:30px;font-weight:700;color:#0D0D0D;margin:0 0 0.4rem}'
-    + 'p{font-size:14px;color:#8C8075;margin:0 0 1.25rem;line-height:1.6}'
-    + 'input{width:100%;font-family:"DM Sans",sans-serif;font-size:15px;padding:12px 14px;border:1px solid rgba(13,13,13,0.14);border-radius:10px;background:#fff;color:#2A2420;box-sizing:border-box}'
-    + 'input:focus{outline:none;border-color:#F2A900}'
-    + 'button{width:100%;margin-top:12px;padding:13px;font-size:15px;font-weight:500;font-family:"DM Sans",sans-serif;color:#0D0D0D;background:#F2A900;border:none;border-radius:10px;cursor:pointer}'
-    + '.err{color:#C04B28;font-size:13px;margin-top:10px;min-height:16px}'
-    + '</style></head><body>'
-    + '<div class="box"><h1>Set your password</h1><p>Choose a password for your dashboard. You’ll type it each time you open it - pick something only you and your team know, at least 6 characters.</p>'
-    + '<form id="f"><input id="p" type="password" autocomplete="new-password" placeholder="New password" autofocus>'
-    + '<input id="p2" type="password" autocomplete="new-password" placeholder="Confirm password" style="margin-top:10px">'
-    + '<button type="submit">Save and open my dashboard</button><div class="err" id="e"></div></form></div>'
-    + '<script>'
-    + 'var f=document.getElementById("f");'
-    + 'f.onsubmit=function(ev){ev.preventDefault();var e=document.getElementById("e");e.textContent="";'
-    + 'var p=document.getElementById("p").value,p2=document.getElementById("p2").value;'
-    + 'if(p.length<6){e.textContent="Use at least 6 characters.";return;}'
-    + 'if(p!==p2){e.textContent="The two passwords do not match.";return;}'
-    + 'fetch("/api/setup",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({passcode:p})})'
-    + '.then(function(r){if(r.ok){location.reload();}else{e.textContent="Could not save that. Try again.";}})'
-    + '.catch(function(){e.textContent="Something went wrong. Try again.";});};'
-    + '</script></body></html>';
+  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Set your password</title><link href="https://fonts.googleapis.com/css2?family=Khand:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"><style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#FAF7F2;font-family:"DM Sans",sans-serif;color:#2A2420}.box{width:90%;max-width:360px;background:#fffdf9;border:1px solid rgba(13,13,13,0.08);border-radius:16px;padding:2rem 1.75rem}h1{font-family:"Khand",sans-serif;font-size:30px;font-weight:700;color:#0D0D0D;margin:0 0 0.4rem}p{font-size:14px;color:#8C8075;margin:0 0 1.25rem;line-height:1.6}input{width:100%;font-family:"DM Sans",sans-serif;font-size:15px;padding:12px 14px;border:1px solid rgba(13,13,13,0.14);border-radius:10px;background:#fff;color:#2A2420;box-sizing:border-box}input:focus{outline:none;border-color:#F2A900}button{width:100%;margin-top:12px;padding:13px;font-size:15px;font-weight:500;font-family:"DM Sans",sans-serif;color:#0D0D0D;background:#F2A900;border:none;border-radius:10px;cursor:pointer}.err{color:#C04B28;font-size:13px;margin-top:10px;min-height:16px}</style></head><body><div class="box"><h1>Set your password</h1><p>Choose a password for your dashboard. You\u2019ll type it each time you open it - pick something only you and your team know, at least 6 characters.</p><form id="f"><input id="p" type="password" autocomplete="new-password" placeholder="New password" autofocus><input id="p2" type="password" autocomplete="new-password" placeholder="Confirm password" style="margin-top:10px"><button type="submit">Save and open my dashboard</button><div class="err" id="e"></div></form></div><script>var f=document.getElementById("f");f.onsubmit=function(ev){ev.preventDefault();var e=document.getElementById("e");e.textContent="";var p=document.getElementById("p").value,p2=document.getElementById("p2").value;if(p.length<6){e.textContent="Use at least 6 characters.";return;}if(p!==p2){e.textContent="The two passwords do not match.";return;}fetch("/api/setup",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({passcode:p})}).then(function(r){if(r.ok){location.reload();}else{e.textContent="Could not save that. Try again.";}}).catch(function(){e.textContent="Something went wrong. Try again.";});};<\/script></body></html>';
 }
-
+__name(setupPage, "setupPage");
 async function authStart(env, source, url) {
   const adapter = ADAPTERS[source];
-  if (!adapter || adapter.auth !== 'oauth' || !adapter.oauth.authorizeUrl) {
-    return new Response('This connection is not set up for browser authorisation yet.', { status: 404 });
+  if (!adapter || adapter.auth !== "oauth" || !adapter.oauth.authorizeUrl) {
+    return new Response("This connection is not set up for browser authorisation yet.", { status: 404 });
   }
   const cfg = adapter.oauth;
   const state = randomState();
-  await env.TOKENS.put('oauthstate:' + source, state, { expirationTtl: 600 });
-  const redirectUri = url.origin + '/auth/' + source + '/callback';
+  await env.TOKENS.put("oauthstate:" + source, state, { expirationTtl: 600 });
+  const redirectUri = url.origin + "/auth/" + source + "/callback";
   const p = new URLSearchParams({
-    response_type: 'code',
-    client_id: env[cfg.clientIdSecret] || '',
+    response_type: "code",
+    client_id: env[cfg.clientIdSecret] || "",
     redirect_uri: redirectUri,
-    scope: cfg.scopes || '',
+    scope: cfg.scopes || "",
     state
   });
-  return Response.redirect(cfg.authorizeUrl + '?' + p.toString(), 302);
+  return Response.redirect(cfg.authorizeUrl + "?" + p.toString(), 302);
 }
-
+__name(authStart, "authStart");
 async function authCallback(env, source, url) {
   const adapter = ADAPTERS[source];
-  const cfg = (adapter && adapter.oauth) || {};
-  const code = url.searchParams.get('code');
-  const gotState = url.searchParams.get('state');
-  const wantState = await env.TOKENS.get('oauthstate:' + source);
+  const cfg = adapter && adapter.oauth || {};
+  const code = url.searchParams.get("code");
+  const gotState = url.searchParams.get("state");
+  const wantState = await env.TOKENS.get("oauthstate:" + source);
   if (!code || !gotState || gotState !== wantState) {
-    return new Response('That authorisation didn’t complete cleanly. Go back to the dashboard and click Reconnect to try again.', { status: 400 });
+    return new Response("That authorisation didn\u2019t complete cleanly. Go back to the dashboard and click Reconnect to try again.", { status: 400 });
   }
-  await env.TOKENS.delete('oauthstate:' + source);
-  const redirectUri = url.origin + '/auth/' + source + '/callback';
+  await env.TOKENS.delete("oauthstate:" + source);
+  const redirectUri = url.origin + "/auth/" + source + "/callback";
   const res = await fetch(cfg.tokenUrl, tokenRequestInit(cfg, {
-    grant_type: 'authorization_code',
+    grant_type: "authorization_code",
     code,
     redirect_uri: redirectUri
   }, env));
   if (!res.ok) {
-    return new Response('The connection couldn’t be finished (the tool said no: ' + res.status + '). Your AI will check the app settings - the usual cause is a redirect address that doesn’t match exactly.', { status: 502 });
+    return new Response("The connection couldn\u2019t be finished (the tool said no: " + res.status + "). Your AI will check the app settings - the usual cause is a redirect address that doesn\u2019t match exactly.", { status: 502 });
   }
   const t = await res.json();
   await saveTokens(env, source, {
     access_token: t.access_token,
     refresh_token: t.refresh_token || null,
-    token_type: t.token_type || 'Bearer',
-    expires_at: Date.now() + ((t.expires_in || 1800) * 1000),
-    obtained_at: new Date().toISOString()
+    token_type: t.token_type || "Bearer",
+    expires_at: Date.now() + (t.expires_in || 1800) * 1e3,
+    obtained_at: (/* @__PURE__ */ new Date()).toISOString()
   });
-  /* After token storage, adapters' status() should resolve org name etc. */
-  return Response.redirect(url.origin + '/', 302);
+  return Response.redirect(url.origin + "/", 302);
 }
-
-/* ---------------- No-API ingest: KV day-store + endpoint ---------------- */
-
-/* Day rows live at data:<source>:<YYYY-MM-DD> as JSON objects of numeric
-   fields. Same-day re-uploads overwrite (idempotent; re-ingesting a corrected
-   export is safe and expected). */
+__name(authCallback, "authCallback");
 async function saveIngestedRows(env, source, rows) {
   if (!Array.isArray(rows)) return 0;
   let saved = 0;
   for (const r of rows) {
-    if (!r || !/^\d{4}-\d{2}-\d{2}$/.test(r.date || '')) continue;
+    if (!r || !/^\d{4}-\d{2}-\d{2}$/.test(r.date || "")) continue;
     const clean = {};
     for (const [k, v] of Object.entries(r)) {
-      if (k !== 'date' && typeof v === 'number' && isFinite(v)) clean[k] = v;
+      if (k !== "date" && typeof v === "number" && isFinite(v)) clean[k] = v;
     }
     if (Object.keys(clean).length === 0) continue;
-    await env.TOKENS.put('data:' + source + ':' + r.date, JSON.stringify(clean));
+    await env.TOKENS.put("data:" + source + ":" + r.date, JSON.stringify(clean));
     saved++;
   }
   return saved;
 }
-
+__name(saveIngestedRows, "saveIngestedRows");
 function eachDate(from, to, cap) {
   const out = [];
-  const d = new Date(from + 'T12:00:00Z');
-  const end = new Date(to + 'T12:00:00Z');
+  const d = /* @__PURE__ */ new Date(from + "T12:00:00Z");
+  const end = /* @__PURE__ */ new Date(to + "T12:00:00Z");
   while (d.getTime() <= end.getTime() && out.length < (cap || 400)) {
     out.push(d.toISOString().slice(0, 10));
     d.setUTCDate(d.getUTCDate() + 1);
   }
   return out;
 }
-
-/* Sum stored day rows across a range. Returns { sums, daysWithData, lastDate }. */
+__name(eachDate, "eachDate");
 async function readIngested(env, source, from, to) {
   const sums = {};
   let daysWithData = 0, lastDate = null;
   for (const date of eachDate(from, to)) {
-    const raw = await env.TOKENS.get('data:' + source + ':' + date);
+    const raw = await env.TOKENS.get("data:" + source + ":" + date);
     if (!raw) continue;
-    daysWithData++; lastDate = date;
+    daysWithData++;
+    lastDate = date;
     try {
       const row = JSON.parse(raw);
       for (const [k, v] of Object.entries(row)) {
-        if (typeof v === 'number' && isFinite(v)) sums[k] = (sums[k] || 0) + v;
+        if (typeof v === "number" && isFinite(v)) sums[k] = (sums[k] || 0) + v;
       }
-    } catch (e) { /* skip bad row */ }
+    } catch (e) {
+    }
   }
   return { sums, daysWithData, lastDate };
 }
-
+__name(readIngested, "readIngested");
 async function monthlyIngested(env, source, fromMonth, toMonth) {
   const months = monthList(fromMonth, toMonth);
   const out = { months, byMonth: [] };
   for (const mo of months) {
-    const [y, m] = mo.split('-').map(Number);
+    const [y, m] = mo.split("-").map(Number);
     const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
-    const r = await readIngested(env, source, mo + '-01', mo + '-' + String(lastDay).padStart(2, '0'));
+    const r = await readIngested(env, source, mo + "-01", mo + "-" + String(lastDay).padStart(2, "0"));
     out.byMonth.push(r.daysWithData ? r.sums : null);
   }
   return out;
 }
-
-/* POST /api/ingest?source=pos|accounting|rostering
-   Authorization: Bearer <INGEST_TOKEN>. Body: the exported file's text.
-   The source's adapter.parseExport() turns it into day rows. */
+__name(monthlyIngested, "monthlyIngested");
 async function apiIngest(env, request, url) {
-  const source = url.searchParams.get('source');
-  if (!['accounting', 'pos', 'rostering'].includes(source)) return json({ error: 'unknown source' }, 400);
-  const auth = request.headers.get('Authorization') || '';
-  if (!env.INGEST_TOKEN || auth !== 'Bearer ' + env.INGEST_TOKEN) {
-    return json({ error: 'not authorised', plain: 'That upload code didn’t match. Check it with your AI and try again.' }, 401);
+  const source = url.searchParams.get("source");
+  if (!["accounting", "pos", "rostering"].includes(source)) return json({ error: "unknown source" }, 400);
+  const auth = request.headers.get("Authorization") || "";
+  if (!env.INGEST_TOKEN || auth !== "Bearer " + env.INGEST_TOKEN) {
+    return json({ error: "not authorised", plain: "That upload code didn\u2019t match. Check it with your AI and try again." }, 401);
   }
   const adapter = ADAPTERS[source];
-  if (!adapter || typeof adapter.parseExport !== 'function') {
-    return json({ error: 'no parser', plain: 'This source isn’t set up for file uploads yet. Your AI adds that when this path is chosen.' }, 501);
+  if (!adapter || typeof adapter.parseExport !== "function") {
+    return json({ error: "no parser", plain: "This source isn\u2019t set up for file uploads yet. Your AI adds that when this path is chosen." }, 501);
   }
   const text = await request.text();
-  if (text.length > 2000000) return json({ error: 'too big', plain: 'That file is too large. Export a shorter date range and try again.' }, 413);
+  if (text.length > 2e6) return json({ error: "too big", plain: "That file is too large. Export a shorter date range and try again." }, 413);
   try {
     const rows = await adapter.parseExport(env, makeHelpers(env, source), {
-      text, contentType: request.headers.get('Content-Type') || ''
+      text,
+      contentType: request.headers.get("Content-Type") || ""
     });
     const saved = await saveIngestedRows(env, source, rows);
-    if (!saved) return json({ error: 'nothing parsed', plain: 'No usable rows were found in that file. Check it’s the right report, or show it to your AI.' }, 422);
+    if (!saved) return json({ error: "nothing parsed", plain: "No usable rows were found in that file. Check it\u2019s the right report, or show it to your AI." }, 422);
     await noteSync(env, source);
     return json({ ok: true, days: saved });
   } catch (e) {
-    return json({ error: 'parse failed', plain: 'That file couldn’t be read. Check it’s the right report, or show it to your AI.' }, 422);
+    return json({ error: "parse failed", plain: "That file couldn\u2019t be read. Check it\u2019s the right report, or show it to your AI." }, 422);
   }
 }
-
-/* ---------------- Metrics API ---------------- */
-
+__name(apiIngest, "apiIngest");
 function parseRange(s) {
   if (!s) return null;
   const m = /^(\d{4}-\d{2}-\d{2}):(\d{4}-\d{2}-\d{2})$/.exec(s);
   return m ? { from: m[1], to: m[2] } : null;
 }
+__name(parseRange, "parseRange");
 function parseMonthRange(s) {
   if (!s) return null;
   const m = /^(\d{4}-\d{2}):(\d{4}-\d{2})$/.exec(s);
   return m ? { fromMonth: m[1], toMonth: m[2] } : null;
 }
-
+__name(parseMonthRange, "parseMonthRange");
 async function sourceStatus(env, source) {
   const adapter = ADAPTERS[source];
   if (!adapter || !adapter.configured) return { configured: false };
@@ -597,102 +710,111 @@ async function sourceStatus(env, source) {
     const st = await adapter.status(env, h);
     return {
       configured: true,
-      ingest: typeof adapter.parseExport === 'function',
+      ingest: typeof adapter.parseExport === "function",
       connected: !!(st && st.connected),
-      org: (st && st.org) || null,
+      org: st && st.org || null,
       sandbox: !!(st && st.sandbox),
-      lastSync: (st && st.lastSync) || (await lastSync(env, source)) || null,
+      lastSync: st && st.lastSync || await lastSync(env, source) || null,
       error: null
     };
   } catch (err) {
     return {
       configured: true,
-      ingest: typeof adapter.parseExport === 'function',
+      ingest: typeof adapter.parseExport === "function",
       connected: false,
       org: null,
       sandbox: false,
-      lastSync: (await lastSync(env, source)) || null,
+      lastSync: await lastSync(env, source) || null,
       error: { code: err.status || 0, plain: plainError(err.status || 500) }
     };
   }
 }
-
+__name(sourceStatus, "sourceStatus");
 async function fetchSlot(env, q) {
-  /* One period slot: pull each configured source; null where unavailable. */
   const out = {};
-  for (const source of ['accounting', 'pos', 'rostering']) {
+  for (const source of ["accounting", "pos", "rostering"]) {
     const adapter = ADAPTERS[source];
-    if (!adapter || !adapter.configured) { out[source] = null; continue; }
+    if (!adapter || !adapter.configured) {
+      out[source] = null;
+      continue;
+    }
     try {
       const h = makeHelpers(env, source);
       out[source] = await adapter.fetchRange(env, h, q);
       await noteSync(env, source);
     } catch (err) {
-      out[source] = null; /* per-source failure never breaks the whole payload */
+      out[source] = null;
     }
   }
   return out;
 }
-
-const METRICS_CACHE_TTL = 120; /* seconds: brief cache for live provider data */
-
+__name(fetchSlot, "fetchSlot");
+var METRICS_CACHE_TTL = 120;
 async function apiMetrics(env, url) {
-  const cur = parseRange(url.searchParams.get('cur'));
-  if (!cur) return json({ error: 'bad cur range' }, 400);
-  const prev = parseRange(url.searchParams.get('prev'));
-  const yoy = parseRange(url.searchParams.get('yoy'));
-  const trend = parseMonthRange(url.searchParams.get('trend'));
-  const tz = url.searchParams.get('tz') || 'Australia/Sydney';
-  const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
-
+  const cur = parseRange(url.searchParams.get("cur"));
+  if (!cur) return json({ error: "bad cur range" }, 400);
+  const prev = parseRange(url.searchParams.get("prev"));
+  const yoy = parseRange(url.searchParams.get("yoy"));
+  const trend = parseMonthRange(url.searchParams.get("trend"));
+  const tz = url.searchParams.get("tz") || "Australia/Sydney";
+  const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get("rollover") || "0", 10) || 0));
   const base = { tz, rollover };
   const [sAcc, sPos, sRos] = await Promise.all([
-    sourceStatus(env, 'accounting'),
-    sourceStatus(env, 'pos'),
-    sourceStatus(env, 'rostering')
+    sourceStatus(env, "accounting"),
+    sourceStatus(env, "pos"),
+    sourceStatus(env, "rostering")
   ]);
-
-  /* The provider calls (periods + trend) are the expensive part and the only
-     thing that brushes provider rate limits on quick reopens/refreshes. Cache
-     them briefly in KV, keyed by the requested ranges; source status stays live.
-     generatedAt is stored with the data so the dashboard's "last synced" reflects
-     the real fetch time even when served from cache. ?refresh=1 forces fresh. */
-  const cacheKey = 'metricscache:' + [
-    url.searchParams.get('cur') || '', url.searchParams.get('prev') || '',
-    url.searchParams.get('yoy') || '', url.searchParams.get('trend') || '',
-    tz, rollover
-  ].join('|');
-  const force = url.searchParams.get('refresh') === '1';
+  const cacheKey = "metricscache:" + [
+    url.searchParams.get("cur") || "",
+    url.searchParams.get("prev") || "",
+    url.searchParams.get("yoy") || "",
+    url.searchParams.get("trend") || "",
+    tz,
+    rollover
+  ].join("|");
+  const force = url.searchParams.get("refresh") === "1";
   let data = null;
   if (!force && env.TOKENS) {
     const cached = await env.TOKENS.get(cacheKey);
-    if (cached) { try { data = JSON.parse(cached); } catch (e) { data = null; } }
+    if (cached) {
+      try {
+        data = JSON.parse(cached);
+      } catch (e) {
+        data = null;
+      }
+    }
   }
   if (!data) {
     const periods = {};
     periods.cur = await fetchSlot(env, { ...base, ...cur });
     periods.prev = prev ? await fetchSlot(env, { ...base, ...prev }) : null;
     periods.yoy = yoy ? await fetchSlot(env, { ...base, ...yoy }) : null;
-
     let trendOut = null;
     if (trend) {
       trendOut = { months: monthList(trend.fromMonth, trend.toMonth) };
-      for (const source of ['accounting', 'pos']) {
+      for (const source of ["accounting", "pos"]) {
         const adapter = ADAPTERS[source];
-        if (!adapter || !adapter.configured) { trendOut[source] = null; continue; }
+        if (!adapter || !adapter.configured) {
+          trendOut[source] = null;
+          continue;
+        }
         try {
           const h = makeHelpers(env, source);
           const series = await adapter.fetchMonthly(env, h, { ...base, ...trend });
           trendOut[source] = alignSeries(trendOut.months, series);
-        } catch (err) { trendOut[source] = null; }
+        } catch (err) {
+          trendOut[source] = null;
+        }
       }
     }
-    data = { generatedAt: new Date().toISOString(), periods: periods, trend: trendOut };
+    data = { generatedAt: (/* @__PURE__ */ new Date()).toISOString(), periods, trend: trendOut };
     if (env.TOKENS) {
-      try { await env.TOKENS.put(cacheKey, JSON.stringify(data), { expirationTtl: METRICS_CACHE_TTL }); } catch (e) {}
+      try {
+        await env.TOKENS.put(cacheKey, JSON.stringify(data), { expirationTtl: METRICS_CACHE_TTL });
+      } catch (e) {
+      }
     }
   }
-
   return json({
     generatedAt: data.generatedAt,
     protected: true,
@@ -701,94 +823,93 @@ async function apiMetrics(env, url) {
     trend: data.trend
   });
 }
-
+__name(apiMetrics, "apiMetrics");
 function monthList(fromMonth, toMonth) {
   const out = [];
-  let [y, m] = fromMonth.split('-').map(Number);
-  const [ey, em] = toMonth.split('-').map(Number);
-  while (y < ey || (y === ey && m <= em)) {
-    out.push(y + '-' + String(m).padStart(2, '0'));
-    m++; if (m > 12) { m = 1; y++; }
+  let [y, m] = fromMonth.split("-").map(Number);
+  const [ey, em] = toMonth.split("-").map(Number);
+  while (y < ey || y === ey && m <= em) {
+    out.push(y + "-" + String(m).padStart(2, "0"));
+    m++;
+    if (m > 12) {
+      m = 1;
+      y++;
+    }
     if (out.length > 60) break;
   }
   return out;
 }
-/* Adapters return {months:[...], <field>:[...]} - align onto the requested grid. */
+__name(monthList, "monthList");
 function alignSeries(months, series) {
   if (!series || !Array.isArray(series.months)) return null;
   const idx = {};
-  series.months.forEach((mo, i) => { idx[mo] = i; });
+  series.months.forEach((mo, i) => {
+    idx[mo] = i;
+  });
   const out = {};
   Object.keys(series).forEach((k) => {
-    if (k === 'months') return;
-    out[k] = months.map((mo) => (mo in idx && series[k] ? (series[k][idx[mo]] ?? null) : null));
+    if (k === "months") return;
+    out[k] = months.map((mo) => mo in idx && series[k] ? series[k][idx[mo]] ?? null : null);
   });
   return out;
 }
-
-/* ---------------- Router ---------------- */
-
+__name(alignSeries, "alignSeries");
 function json(obj, status) {
   return new Response(JSON.stringify(obj), {
     status: status || 200,
-    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" }
   });
 }
-
-export default {
+__name(json, "json");
+var worker_default = {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
-
-    if (path === '/favicon.ico') return new Response(null, { status: 204 });
-    if (path === '/api/login' && request.method === 'POST') return apiLogin(env, request);
-    if (path === '/api/setup' && request.method === 'POST') return apiSetup(env, request);
-    if (path === '/api/logout' && request.method === 'POST') return apiLogout();
-    if (path === '/api/ingest' && request.method === 'POST') return apiIngest(env, request, url);
-
+    if (path === "/favicon.ico") return new Response(null, { status: 204 });
+    if (path === "/api/login" && request.method === "POST") return apiLogin(env, request);
+    if (path === "/api/setup" && request.method === "POST") return apiSetup(env, request);
+    if (path === "/api/logout" && request.method === "POST") return apiLogout();
+    if (path === "/api/ingest" && request.method === "POST") return apiIngest(env, request, url);
     const loggedIn = await isLoggedIn(request, env);
-
-    if (path === '/' || path === '/index.html') {
+    if (path === "/" || path === "/index.html") {
       if (loggedIn) return htmlResponse(dashboardHtml);
-      return htmlResponse((await passcodeSet(env)) ? loginPage() : setupPage());
+      return htmlResponse(await passcodeSet(env) ? loginPage() : setupPage());
     }
-    if (path === '/api/metrics' && request.method === 'GET') {
-      if (!loggedIn) return json({ error: 'auth' }, 401);
+    if (path === "/api/metrics" && request.method === "GET") {
+      if (!loggedIn) return json({ error: "auth" }, 401);
       return apiMetrics(env, url);
     }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
-    if (authRoute && request.method === 'GET') {
-      if (!loggedIn) return Response.redirect(url.origin + '/', 302);
-      return authRoute[2] === 'start' ? authStart(env, authRoute[1], url) : authCallback(env, authRoute[1], url);
+    if (authRoute && request.method === "GET") {
+      if (!loggedIn) return Response.redirect(url.origin + "/", 302);
+      return authRoute[2] === "start" ? authStart(env, authRoute[1], url) : authCallback(env, authRoute[1], url);
     }
-    if (path === '/api/disconnect' && request.method === 'POST') {
-      if (!loggedIn) return json({ error: 'auth' }, 401);
-      const source = url.searchParams.get('source');
-      if (['accounting', 'pos', 'rostering'].includes(source)) {
+    if (path === "/api/disconnect" && request.method === "POST") {
+      if (!loggedIn) return json({ error: "auth" }, 401);
+      const source = url.searchParams.get("source");
+      if (["accounting", "pos", "rostering"].includes(source)) {
         await clearTokens(env, source);
         return json({ ok: true });
       }
-      return json({ error: 'unknown source' }, 400);
+      return json({ error: "unknown source" }, 400);
     }
-    return new Response('Not found', { status: 404 });
+    return new Response("Not found", { status: 404 });
   },
-
   /* Cron rung: uncomment [triggers] in wrangler.toml and give any adapter a
      scheduledPull() to fetch its tool's own export on a schedule. */
   async scheduled(event, env, ctx) {
-    for (const source of ['accounting', 'pos', 'rostering']) {
+    for (const source of ["accounting", "pos", "rostering"]) {
       const a = ADAPTERS[source];
-      if (a && typeof a.scheduledPull === 'function') {
+      if (a && typeof a.scheduledPull === "function") {
         try {
           await a.scheduledPull(env, makeHelpers(env, source));
           await noteSync(env, source);
         } catch (e) {
-          console.log('scheduledPull failed for ' + source + ': ' + (e && e.message));
+          console.log("scheduledPull failed for " + source + ": " + (e && e.message));
         }
       }
     }
   },
-
   /* Email rung (Path B): the tool's own report scheduler emails its export;
      the owner's domain on their Cloudflare routes that address here (Email
      Routing -> this Worker). Complete when this rung is chosen:
@@ -799,7 +920,9 @@ export default {
           like /api/ingest
      Until then this logs and discards. */
   async email(message, env, ctx) {
-    console.log('email received from ' + message.from + '; email ingest not wired yet');
+    console.log("email received from " + message.from + "; email ingest not wired yet");
   }
 };
-// EOF worker.js
+export {
+  worker_default as default
+};
