@@ -29,7 +29,17 @@
 
    Bindings expected (wrangler.toml): TOKENS (KV). Secrets: see each adapter.
    Wired for Pier St Cafe: accounting = Xero (OAuth), rostering = Deputy
-   (permanent token). POS not yet wired.
+   (permanent token). POS = Impos via WhatsApp Daily Insight upload.
+
+   Performance pass (Nov 2026) - Xero + Deputy only, POS untouched:
+     - each Xero P&L is cached per date range (closed ranges 6h, open 10 min)
+     - the 24-month trend is cached per 12-month block, shared by every period
+     - at most 3 Xero reports run at once (Xero allows 5 concurrent per org),
+       with one gentle retry if Xero says "slow down"
+     - one token refresh at a time (Xero refresh tokens are single-use)
+     - Deputy rosters are fetched for the current period only (the only one
+       the page shows), cached, and the Deputy login check is cached 30 min
+     - the Refresh button (?refresh=1) still bypasses every cache
 ============================================================================ */
 
 import dashboardHtml from './dashboard.html';
@@ -82,6 +92,49 @@ function addDays(date, n) {
   return d.toISOString().slice(0, 10);
 }
 
+/* ---------- speed helpers: small KV cache + Xero request limiter ---------- */
+const CLOSED_TTL = 6 * 60 * 60;   /* a range that has fully ended: 6 hours */
+const OPEN_TTL = 10 * 60;         /* a range that includes today: 10 minutes */
+function rangeTtl(to, today) {
+  return to < today ? CLOSED_TTL : OPEN_TTL;
+}
+/* Returns the cached value for key, or runs fn() and caches its result.
+   force (the Refresh button) skips the read but still refreshes the cache. */
+async function kvCached(env, key, ttl, force, fn) {
+  if (!force && env.TOKENS) {
+    const hit = await env.TOKENS.get(key);
+    if (hit) {
+      try { return JSON.parse(hit); } catch (e) {}
+    }
+  }
+  const val = await fn();
+  if (val != null && env.TOKENS) {
+    try { await env.TOKENS.put(key, JSON.stringify(val), { expirationTtl: Math.max(60, ttl) }); } catch (e) {}
+  }
+  return val;
+}
+/* Xero allows 5 concurrent calls per organisation; the dashboard used to fire
+   5+ big P&L reports at once and get "slow down" answers back. Three at a
+   time keeps clear of the limit (with room for the connection check). A
+   finishing call hands its slot straight to the next waiting one. */
+const XERO_MAX_PARALLEL = 3;
+let xeroActive = 0;
+const xeroQueue = [];
+async function xeroSlot(fn) {
+  if (xeroActive < XERO_MAX_PARALLEL) xeroActive++;
+  else await new Promise((r) => xeroQueue.push(r));
+  try {
+    return await fn();
+  } finally {
+    const next = xeroQueue.shift();
+    if (next) next();
+    else xeroActive--;
+  }
+}
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 /* ---------- Xero (accounting) ---------- */
 const XERO_API = "https://api.xero.com";
 /* Wage + super accounts are picked out of Operating Expenses by account name. */
@@ -115,9 +168,18 @@ async function xeroTenant(env, h) {
 async function xeroPnl(env, h, params) {
   const t = await xeroTenant(env, h);
   const qs = new URLSearchParams(params);
-  const data = await h.fetchJson(XERO_API + "/api.xro/2.0/Reports/ProfitAndLoss?" + qs.toString(), {
+  const call = () => h.fetchJson(XERO_API + "/api.xro/2.0/Reports/ProfitAndLoss?" + qs.toString(), {
     headers: { Accept: "application/json", "xero-tenant-id": t.tenantId }
   });
+  let data;
+  try {
+    data = await xeroSlot(call);
+  } catch (err) {
+    if (err.status !== 429) throw err;
+    /* Xero asked us to slow down: wait a moment and try once more */
+    await sleep(2000);
+    data = await xeroSlot(call);
+  }
   const rep = data && data.Reports && data.Reports[0];
   if (!rep) {
     const e = new Error("no report");
@@ -185,8 +247,8 @@ function deputyHeaders(env) {
    "No. of transactions:" line before the next "Date:" line. */
 function parseDailyInsight(text) {
   const clean = String(text)
-    .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "")
-    .replace(/[\u00a0\u202f]/g, " ")
+    .replace(/[‎‏‪-‮⁦-⁩﻿]/g, "")
+    .replace(/[  ]/g, " ")
     .replace(/\r\n?/g, "\n");
   const DATE_RE = /^\W*date\s*[:\-]\s*(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})\b/i;
   const COUNT_RE = /^\W*(?:no\.?\s*of|number\s+of)?\s*transactions\s*[:\-]\s*([\d,]+)\s*$/i;
@@ -303,26 +365,50 @@ const ADAPTERS = {
         sandbox: /demo company/i.test(t.tenantName || "")
       };
     },
+    /* One P&L per date range, cached by organisation + range. */
     async fetchRange(env, h, q) {
-      const rep = await xeroPnl(env, h, { fromDate: q.from, toDate: q.to });
-      return xeroSplit(rep)[0];
+      const t = await xeroTenant(env, h);
+      const ttl = rangeTtl(q.to, venueToday(q.tz));
+      return kvCached(env, "xero:pnl:" + t.tenantId + ":" + q.from + ":" + q.to, ttl, q.force, async () => {
+        const rep = await xeroPnl(env, h, { fromDate: q.from, toDate: q.to });
+        return xeroSplit(rep)[0];
+      });
     },
+    /* Monthly trend. Finished months are fetched in blocks of up to 12 (Xero's
+       cap) and cached for 6 hours; the current month on its own, cached 10 min.
+       The same blocks serve every period view, so switching periods is instant. */
     async fetchMonthly(env, h, q) {
+      const t = await xeroTenant(env, h);
       const months = monthList(q.fromMonth, q.toMonth);
+      const thisMonth = venueToday(q.tz).slice(0, 7);
+      const closed = months.filter((mo) => mo < thisMonth);
+      const open = months.filter((mo) => mo >= thisMonth);
       const byMonth = {};
-      let end = months.length - 1;
+      const tasks = [];
+      let end = closed.length - 1;
       while (end >= 0) {
         const n = Math.min(12, end + 1);
-        const endMo = months[end];
-        const params = { fromDate: endMo + "-01", toDate: lastDayOfMonth(endMo), timeframe: "MONTH" };
-        if (n > 1) params.periods = String(n - 1);
-        const cols = xeroSplit(await xeroPnl(env, h, params));
-        /* Xero lists the requested month first, then each earlier month */
-        for (let i = 0; i < n; i++) {
-          if (cols[i]) byMonth[shiftMonth(endMo, -i)] = cols[i];
-        }
+        const endMo = closed[end];
+        tasks.push(kvCached(env, "xero:trend:" + t.tenantId + ":" + endMo + ":" + n, CLOSED_TTL, q.force, async () => {
+          const params = { fromDate: endMo + "-01", toDate: lastDayOfMonth(endMo), timeframe: "MONTH" };
+          if (n > 1) params.periods = String(n - 1);
+          return xeroSplit(await xeroPnl(env, h, params));
+        }).then((cols) => {
+          /* Xero lists the requested month first, then each earlier month */
+          for (let i = 0; i < n; i++) {
+            if (cols && cols[i]) byMonth[shiftMonth(endMo, -i)] = cols[i];
+          }
+        }).catch(() => { /* this block shows as gaps; the rest of the trend still draws */ }));
         end -= n;
       }
+      for (const mo of open) {
+        tasks.push(kvCached(env, "xero:trend:" + t.tenantId + ":" + mo + ":open", OPEN_TTL, q.force, async () => {
+          return xeroSplit(await xeroPnl(env, h, { fromDate: mo + "-01", toDate: lastDayOfMonth(mo) }))[0];
+        }).then((col) => {
+          if (col) byMonth[mo] = col;
+        }).catch(() => { /* gap for this month only */ }));
+      }
+      await Promise.all(tasks);
       const out = { months, revenue: [], cogs: [], wagesSuper: [], overheads: [] };
       for (const mo of months) {
         const c = byMonth[mo];
@@ -400,6 +486,8 @@ const ADAPTERS = {
        status(env, h)        -> { connected, org, sandbox, lastSync }
        fetchRange(env, h, q) -> { cost }    (rostered labour cost for the
                                   period; powers the PROJECTED wage % only)
+     Only the current period is asked for (see fetchSlot) - the page shows the
+     projected wage % for the period on screen, never for the comparisons.
   */
   rostering: {
     configured: true,
@@ -408,7 +496,11 @@ const ADAPTERS = {
     async status(env, h) {
       const base = deputyBase(env);
       if (!env.ROSTERING_API_TOKEN || !base) return { connected: false };
-      await h.fetchJson(base + "/api/v1/me", { headers: deputyHeaders(env) });
+      /* The login check is cached for 30 minutes so it isn't repeated on every open. */
+      await kvCached(env, "deputy:me:" + base, 30 * 60, false, async () => {
+        await h.fetchJson(base + "/api/v1/me", { headers: deputyHeaders(env) });
+        return { ok: true };
+      });
       let org = base;
       try {
         org = new URL(base).hostname.split(".")[0];
@@ -419,27 +511,30 @@ const ADAPTERS = {
     async fetchRange(env, h, q) {
       const base = deputyBase(env);
       if (!env.ROSTERING_API_TOKEN || !base) throw new NotConfigured("rostering");
-      let start = 0, cost = 0;
-      for (let page = 0; page < 50; page++) {
-        const body = {
-          search: {
-            s1: { field: "Date", type: "ge", data: q.from },
-            s2: { field: "Date", type: "lt", data: addDays(q.to, 1) }
-          },
-          start,
-          max: 500
-        };
-        const rows = await h.fetchJson(base + "/api/v1/resource/Roster/QUERY", {
-          method: "POST",
-          headers: deputyHeaders(env),
-          body: JSON.stringify(body)
-        });
-        if (!Array.isArray(rows) || !rows.length) break;
-        for (const r of rows) cost += num(r.Cost);
-        if (rows.length < 500) break;
-        start += 500;
-      }
-      return { cost: round2(cost) };
+      const ttl = rangeTtl(q.to, venueToday(q.tz));
+      return kvCached(env, "deputy:cost:" + base + ":" + q.from + ":" + q.to, ttl, q.force, async () => {
+        let start = 0, cost = 0;
+        for (let page = 0; page < 50; page++) {
+          const body = {
+            search: {
+              s1: { field: "Date", type: "ge", data: q.from },
+              s2: { field: "Date", type: "lt", data: addDays(q.to, 1) }
+            },
+            start,
+            max: 500
+          };
+          const rows = await h.fetchJson(base + "/api/v1/resource/Roster/QUERY", {
+            method: "POST",
+            headers: deputyHeaders(env),
+            body: JSON.stringify(body)
+          });
+          if (!Array.isArray(rows) || !rows.length) break;
+          for (const r of rows) cost += num(r.Cost);
+          if (rows.length < 500) break;
+          start += 500;
+        }
+        return { cost: round2(cost) };
+      });
     },
     async fetchMonthly(env, h, q) {
       return { months: [], cost: [] };
@@ -503,15 +598,24 @@ function tokenRequestInit(cfg, params, env) {
 }
 
 /* Returns a valid access token for an OAuth source, refreshing (and
-   persisting the ROTATED refresh token) when needed. */
+   persisting the ROTATED refresh token) when needed. Only ONE refresh runs at
+   a time per source: Xero refresh tokens are single-use, so several parallel
+   report calls each refreshing at once used to race and could knock the
+   connection over. Callers that arrive mid-refresh wait for that one. */
+const refreshInFlight = {};
 async function getValidAccessToken(env, source) {
-  const adapter = ADAPTERS[source];
   const tokens = await getTokens(env, source);
   if (!tokens || !tokens.access_token) { const e = new Error('no tokens'); e.status = 401; throw e; }
   const skewMs = 60 * 1000;
   if (!tokens.expires_at || Date.now() < tokens.expires_at - skewMs) return tokens.access_token;
-
-  /* refresh */
+  if (!refreshInFlight[source]) {
+    refreshInFlight[source] = refreshAccessToken(env, source, tokens)
+      .finally(() => { delete refreshInFlight[source]; });
+  }
+  return refreshInFlight[source];
+}
+async function refreshAccessToken(env, source, tokens) {
+  const adapter = ADAPTERS[source];
   const cfg = adapter.oauth || {};
   if (!tokens.refresh_token || !cfg.tokenUrl) { const e = new Error('cannot refresh'); e.status = 401; throw e; }
   const res = await fetch(cfg.tokenUrl, tokenRequestInit(cfg, {
@@ -926,13 +1030,16 @@ async function sourceStatus(env, source) {
   }
 }
 
-async function fetchSlot(env, q) {
+async function fetchSlot(env, q, slot) {
   /* One period slot: pull each configured source; null where unavailable. */
   /* Sources are fetched in parallel - one slow tool never holds up the others. */
+  /* Rostering (projected wage %) is only shown for the period on screen, so
+     the comparison slots skip the Deputy roster pull entirely. */
   const out = {};
   await Promise.all(['accounting', 'pos', 'rostering'].map(async (source) => {
     const adapter = ADAPTERS[source];
     if (!adapter || !adapter.configured) { out[source] = null; return; }
+    if (source === 'rostering' && slot !== 'cur') { out[source] = null; return; }
     try {
       const h = makeHelpers(env, source);
       out[source] = await adapter.fetchRange(env, h, q);
@@ -955,8 +1062,10 @@ async function apiMetrics(env, url) {
   const trend = parseMonthRange(url.searchParams.get('trend'));
   const tz = url.searchParams.get('tz') || 'Australia/Sydney';
   const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
+  const force = url.searchParams.get('refresh') === '1';
 
-  const base = { tz, rollover };
+  /* force travels to the adapters so Refresh also bypasses their own caches */
+  const base = { tz, rollover, force };
   const [sAcc, sPos, sRos] = await Promise.all([
     sourceStatus(env, 'accounting'),
     sourceStatus(env, 'pos'),
@@ -973,7 +1082,6 @@ async function apiMetrics(env, url) {
     url.searchParams.get('yoy') || '', url.searchParams.get('trend') || '',
     tz, rollover
   ].join('|');
-  const force = url.searchParams.get('refresh') === '1';
   let data = null;
   if (!force && env.TOKENS) {
     const cached = await env.TOKENS.get(cacheKey);
@@ -996,9 +1104,9 @@ async function apiMetrics(env, url) {
       return t;
     };
     const [pCur, pPrev, pYoy, trendOut] = await Promise.all([
-      fetchSlot(env, { ...base, ...cur }),
-      prev ? fetchSlot(env, { ...base, ...prev }) : null,
-      yoy ? fetchSlot(env, { ...base, ...yoy }) : null,
+      fetchSlot(env, { ...base, ...cur }, 'cur'),
+      prev ? fetchSlot(env, { ...base, ...prev }, 'prev') : null,
+      yoy ? fetchSlot(env, { ...base, ...yoy }, 'yoy') : null,
       trendTask()
     ]);
     const periods = { cur: pCur, prev: pPrev, yoy: pYoy };
